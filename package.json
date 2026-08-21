@@ -41,6 +41,7 @@
   "scripts": {
     "init": "bun src/index.ts init",
     "check": "bun src/index.ts check",
+    "pull": "bun src/index.ts pull",
     "force": "bun src/index.ts check --force",
     "launchd:install": "bun src/index.ts install-launchd",
     "launchd:uninstall": "bun src/index.ts uninstall-launchd",
@@ -52,7 +53,8 @@
     "prepack": "bun run typecheck"
   },
   "devDependencies": {
-    "@types/node": "24.0.0",
+    "@types/bun": "^1.4.0",
+    "@types/node": "^26.2.0",
     "typescript": "5.8.2"
   },
   "engines": {

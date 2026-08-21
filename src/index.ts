@@ -6,6 +6,13 @@ import os from "node:os";
 import type { Buffer } from "node:buffer";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import {
+  downloadAndVerifyAsset,
+  extractBinaryFromArchive,
+  loadBlessedAndManifest,
+  parseBlessedHostManifest,
+  resolveArcusTargetKey,
+} from "./arcus";
 
 type RawCfg = {
   release_repo: string;
@@ -58,6 +65,10 @@ type State = {
   app?: string;
   log?: string;
   at?: string;
+  source?: string;
+  sha256?: string;
+  manifest?: string;
+  fleet_version?: string;
 };
 
 type OpenCodeProcess = {
@@ -103,6 +114,7 @@ async function main() {
   if (cli.cmd === "launchd" && cli.positionals[1] === "install") return installLaunchd(cfg);
   if (cli.cmd === "install-ready") return installReady(cfg, { waitForOpenCode: cli.waitForOpenCode });
   if (cli.cmd === "install-when-closed") return installWhenClosed(cfg);
+  if (cli.cmd === "pull" || cli.cmd === "pull-arcus") return pull(cfg, cli.force);
   if (cli.cmd === "preview") return preview(cfg);
   if (cli.cmd === "status") return status(cfg);
   if (cli.cmd === "check") return check(cfg, cli.force);
@@ -154,6 +166,7 @@ function parseCli(rawArgs: string[]): Cli {
 
 function needsConfig(cli: Cli) {
   if (cli.cmd === "check") return cli.positionals.length <= 1;
+  if (cli.cmd === "pull" || cli.cmd === "pull-arcus") return cli.positionals.length <= 1;
   if (cli.cmd === "preview") return cli.positionals.length === 1;
   if (cli.cmd === "status") return cli.positionals.length === 1;
   if (cli.cmd === "install-ready") return cli.positionals.length === 1;
@@ -173,7 +186,7 @@ function printHelp() {
 }
 
 function helpText() {
-  return `OpenCode Release Watch\n\nUsage:\n  orw [--config <path>] [command] [options]\n  orw --help\n\nCommands:\n  init                  Create orw.config.json in the current directory\n  preview               Print the integration prompt for the latest release\n  check                 Build the latest release if needed; default command\n  status                Print the last successful build/install state\n  install-ready         Install the last verified artifacts\n  install-when-closed   Wait for OpenCode to quit, then install\n  launchd install       Install the macOS launchd scheduler\n  launchd uninstall     Remove the macOS launchd scheduler\n\nOptions:\n  -c, --config <path>       Use a specific config file\n  --force                   Rebuild even if the latest release was processed\n  --wait-for-opencode       With install-ready, wait until OpenCode quits\n  -h, --help                Show this help\n`;
+  return `OpenCode Release Watch\n\nUsage:\n  orw [--config <path>] [command] [options]\n  orw --help\n\nCommands:\n  init                  Create orw.config.json in the current directory\n  preview               Print the integration prompt for the latest release\n  pull                  Download and install verified OpenCode binary from Arcus\n  check                 Build the latest release if needed; default command\n  status                Print the last successful build/install state\n  install-ready         Install the last verified artifacts\n  install-when-closed   Wait for OpenCode to quit, then install\n  launchd install       Install the macOS launchd scheduler\n  launchd uninstall     Remove the macOS launchd scheduler\n\nOptions:\n  -c, --config <path>       Use a specific config file\n  --force                   Rebuild or re-download even if already processed\n  --wait-for-opencode       With install-ready, wait until OpenCode quits\n  -h, --help                Show this help\n`;
 }
 
 async function load(configPath?: string) {
@@ -292,6 +305,81 @@ function lockPath(cfg: Cfg) {
 
 function logDir(cfg: Cfg) {
   return path.join(cfg.runtime_dir, "logs");
+}
+
+async function pull(cfg: Cfg, force: boolean) {
+  const searchPaths = [
+    cfg.config_dir,
+    path.join(cfg.config_dir, "submodules", "arcus"),
+    path.join(cfg.config_dir, "..", "arcus"),
+    path.join(os.homedir(), ".config", "opencode", "arcus"),
+    "/Volumes/Topper2TB/Git/arcus",
+  ];
+
+  const targetKey = resolveArcusTargetKey(process.platform, process.arch);
+  const { blessed, manifest, manifestRelativePath } = await loadBlessedAndManifest(
+    undefined,
+    searchPaths,
+  );
+  const info = parseBlessedHostManifest(blessed, manifest, targetKey);
+
+  const prev = await readState(cfg);
+  if (!force && prev.tag === info.tag && prev.sha256 === info.asset.sha256) {
+    return out(
+      `Already up to date with blessed OpenCode ${info.tag} (fleet ${info.fleetVersion}). Use --force to reinstall.`,
+    );
+  }
+
+  const free = await hold(cfg, force);
+  try {
+    out(`=== Arcus Binary Pull: OpenCode ${info.tag} (${targetKey}) ===`);
+    out(`  Fleet Version: ${info.fleetVersion}`);
+    out(`  Asset:         ${info.asset.filename}`);
+    out(`  Release URL:   ${info.asset.url}`);
+    out(`  Expected SHA:  ${info.asset.sha256}`);
+    out("");
+
+    const cacheDir = path.join(cfg.runtime_dir, "cache", `arcus-${info.version}-${Date.now()}`);
+    const archivePath = path.join(cacheDir, info.asset.filename);
+    const extractDir = path.join(cacheDir, "extracted");
+
+    out(`-> Downloading verified binary asset...`);
+    await downloadAndVerifyAsset(info.asset.url, info.asset.sha256, archivePath);
+    out(`   ✓ Download verified against SHA256 checksum`);
+
+    out(`-> Extracting binary payload...`);
+    const binaryPath = await extractBinaryFromArchive(archivePath, info.binaryName, extractDir);
+    out(`   ✓ Extracted ${info.binaryName}`);
+
+    out(`-> Installing CLI binary...`);
+    await installCli(binaryPath);
+
+    const nextState: State = {
+      tag: info.tag,
+      branch: "arcus/host",
+      release_url: info.asset.url,
+      cli: path.join(os.homedir(), ".opencode", "bin", info.binaryName),
+      source: "arcus",
+      sha256: info.asset.sha256,
+      manifest: manifestRelativePath,
+      fleet_version: info.fleetVersion,
+      at: new Date().toISOString(),
+    };
+    await writeState(cfg, nextState);
+
+    await notify(
+      "OpenCode Arcus binary installed",
+      `${info.tag} (${info.fleetVersion}) installed to ~/.opencode/bin/${info.binaryName}`,
+    );
+
+    out("");
+    out(`[OK] Successfully installed OpenCode ${info.tag} from Arcus.`);
+    out(`  Target:  ${path.join(os.homedir(), ".opencode", "bin", info.binaryName)}`);
+    out(`  Version: ${info.version}`);
+    out(`  Fleet:   ${info.fleetVersion}`);
+  } finally {
+    await free();
+  }
 }
 
 async function check(cfg: Cfg, force: boolean) {
